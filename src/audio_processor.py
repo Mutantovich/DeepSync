@@ -3,108 +3,124 @@ import torchaudio
 import logging
 import sys
 import os
-from pathlib import Path
+import gc
+import re
+from demucs.apply import apply_model
 from demucs.pretrained import get_model
-from transformers import (WhisperProcessor, WhisperForConditionalGeneration,
-                         M2M100ForConditionalGeneration, M2M100Tokenizer)
-from huggingface_hub import snapshot_download
-import shutil
+from transformers import (
+    WhisperProcessor,
+    WhisperForConditionalGeneration,
+)
 from tqdm import tqdm
+from llama_cpp import Llama
 
-# Настраиваем логирование
-logging.basicConfig(level=logging.INFO, stream=sys.stdout,
-                   format='%(asctime)s - %(levelname)s - %(message)s')
+# ----------------------------------------------------------------------
+# Отключаем телеметрию и принудительно включаем офлайн-режим
+# ----------------------------------------------------------------------
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TORCH_HUB_OFFLINE"] = "1"
+
+# ----------------------------------------------------------------------
+# Настройка логирования
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+
+def ensure_stereo(waveform: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    """Преобразует аудио в стерео (2 канала) для Demucs."""
+    if waveform.shape[0] == 1:
+        waveform = waveform.repeat(2, 1)
+        logger.info("Аудио преобразовано из моно в стерео (дублирование канала)")
+    elif waveform.shape[0] > 2:
+        waveform = waveform[:2, :]
+        logger.info(f"Аудио имело {waveform.shape[0]} каналов, использованы первые два")
+    else:
+        logger.info("Аудио уже стерео (2 канала)")
+    return waveform
+
 
 class AudioProcessor:
     CACHE_DIR = os.path.expanduser("~/.cache/huggingface/")
     MODELS = {
         "whisper-base": "openai/whisper-base",
-        "m2m100": "facebook/m2m100_418M"
     }
+
+    # Параметры модели OmniLing на Hugging Face Hub (GGUF)
+    OMNILING_REPO = "QuantFactory/OmniLing-V1-8b-experimental-GGUF"
+    OMNILING_FILENAME = "OmniLing-V1-8b-experimental.Q4_K_M.gguf"
 
     def __init__(self):
         logger.info("Начинаем инициализацию AudioProcessor...")
-        
-        # Устанавливаем устройство
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Используется устройство: {self.device}")
-        
-        # Проверяем наличие кэш-директории
-        logger.info(f"Проверка кэш-директории: {self.CACHE_DIR}")
+
         os.makedirs(self.CACHE_DIR, exist_ok=True)
-        
-        # Убеждаемся, что все модели загружены в кэш
+
+        self._demucs_model = None
+
+        # Проверяем и загружаем Whisper
         self._ensure_models_available()
-        
-        # Инициализируем модели
-        logger.info("Инициализация моделей...")
-        self._initialize_models()
-        
+        self._initialize_whisper()
+
+        # Загружаем модель перевода OmniLing через llama-cpp-python (автоматическая загрузка)
+        logger.info("Инициализация модели перевода OmniLing (GGUF)...")
+        self._initialize_omnilig()
+
         logger.info("Инициализация AudioProcessor завершена успешно")
 
+    # ------------------------------------------------------------------
+    # Работа с кэшем Whisper
+    # ------------------------------------------------------------------
     def _model_is_cached(self, model_id: str) -> bool:
-        """
-        Проверяет, загружена ли модель в кэш, пытаясь загрузить процессор с local_files_only=True.
-        Для M2M100 используем токенизатор.
-        """
         try:
-            if "whisper" in model_id:
-                WhisperProcessor.from_pretrained(model_id, local_files_only=True, cache_dir=self.CACHE_DIR)
-            else:
-                M2M100Tokenizer.from_pretrained(model_id, local_files_only=True, cache_dir=self.CACHE_DIR)
+            WhisperProcessor.from_pretrained(model_id, local_files_only=True, cache_dir=self.CACHE_DIR)
             return True
         except Exception:
             return False
 
     def _ensure_models_available(self):
-        """Загружает все модели, если их нет в кэше"""
-        for model_name, model_id in self.MODELS.items():
-            if self._model_is_cached(model_id):
-                logger.info(f"Модель {model_name} уже есть в кэше")
-            else:
-                logger.info(f"Модель {model_name} не найдена в кэше, начинаем загрузку...")
-                self._download_model(model_name, model_id)
+        model_name = "whisper-base"
+        model_id = self.MODELS[model_name]
+        if self._model_is_cached(model_id):
+            logger.info(f"Модель {model_name} уже есть в кэше")
+        else:
+            logger.info(f"Модель {model_name} не найдена, загружаем...")
+            self._download_model(model_name, model_id)
 
     def _download_model(self, model_name: str, model_id: str):
-        """Загружает модель через snapshot_download в стандартную структуру кэша"""
-        logger.info(f"Загрузка модели {model_name} ({model_id}) из Hugging Face...")
+        from huggingface_hub import snapshot_download
+        import shutil
+
+        logger.info(f"Загрузка {model_name} ({model_id})...")
         try:
             snapshot_download(
                 repo_id=model_id,
                 cache_dir=self.CACHE_DIR,
                 tqdm_class=tqdm,
                 force_download=False,
-                resume_download=True
+                resume_download=True,
             )
             logger.info(f"Модель {model_name} успешно загружена")
         except Exception as e:
-            logger.error(f"Ошибка при загрузке {model_name}: {str(e)}")
-            # Удаляем возможный частичный кэш, чтобы избежать повреждённых данных
+            logger.error(f"Ошибка загрузки {model_name}: {e}")
             cache_subdir = "models--" + model_id.replace("/", "--")
             cache_path = os.path.join(self.CACHE_DIR, cache_subdir)
             if os.path.exists(cache_path):
                 shutil.rmtree(cache_path, ignore_errors=True)
-            raise RuntimeError(f"Не удалось загрузить модель {model_name}") from e
+            raise RuntimeError(f"Не удалось загрузить {model_name}") from e
 
-    def _initialize_models(self):
-        """Инициализирует все модели (Demucs, Whisper, переводчик)"""
-        # Инициализация Demucs
-        logger.info("Инициализация Demucs...")
-        try:
-            self.demucs_model = get_model('htdemucs')
-            self.demucs_model.eval()
-            self.demucs_model.to(self.device)
-            logger.info("Demucs инициализирован успешно")
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации Demucs: {str(e)}")
-            raise
-
-        # Инициализация Whisper
-        logger.info("Инициализация Whisper...")
+    # ------------------------------------------------------------------
+    # Инициализация Whisper
+    # ------------------------------------------------------------------
+    def _initialize_whisper(self):
         whisper_id = self.MODELS["whisper-base"]
         try:
-            # Пытаемся загрузить локально
             self.whisper_processor = WhisperProcessor.from_pretrained(
                 whisper_id, local_files_only=True, cache_dir=self.CACHE_DIR
             )
@@ -121,106 +137,201 @@ class AudioProcessor:
                 whisper_id, local_files_only=False, cache_dir=self.CACHE_DIR
             ).to(self.device)
             logger.info("Whisper загружен из сети и сохранён в кэш")
-        logger.info("Whisper инициализирован успешно")
+        logger.info("Whisper готов")
 
-        # Инициализация переводчика M2M100
-        logger.info("Инициализация переводчика...")
-        m2m_id = self.MODELS["m2m100"]
+    # ------------------------------------------------------------------
+    # Инициализация OmniLing через llama-cpp-python (автоматическая загрузка)
+    # ------------------------------------------------------------------
+    def _initialize_omnilig(self):
+        logger.info(f"Загрузка модели OmniLing из репозитория {self.OMNILING_REPO}, файл {self.OMNILING_FILENAME}")
         try:
-            self.translator_model = M2M100ForConditionalGeneration.from_pretrained(
-                m2m_id, local_files_only=True, cache_dir=self.CACHE_DIR
-            ).to(self.device)
-            self.translator_tokenizer = M2M100Tokenizer.from_pretrained(
-                m2m_id, local_files_only=True, cache_dir=self.CACHE_DIR
+            self.translator = Llama.from_pretrained(
+                repo_id=self.OMNILING_REPO,
+                filename=self.OMNILING_FILENAME,
+                n_gpu_layers=-1,        # все слои на GPU (если не хватит памяти, уменьшите)
+                n_ctx=2048,
+                verbose=False,
             )
-            logger.info("Переводчик загружен из кэша")
-        except Exception:
-            logger.info("Локальная копия переводчика не найдена, загружаем из сети...")
-            self.translator_model = M2M100ForConditionalGeneration.from_pretrained(
-                m2m_id, local_files_only=False, cache_dir=self.CACHE_DIR
-            ).to(self.device)
-            self.translator_tokenizer = M2M100Tokenizer.from_pretrained(
-                m2m_id, local_files_only=False, cache_dir=self.CACHE_DIR
-            )
-            logger.info("Переводчик загружен из сети и сохранён в кэш")
-        logger.info("Переводчик инициализирован успешно")
+            self.translator_tokenizer = None  # не нужен, всё встроено
+            logger.info("Модель перевода OmniLing успешно загружена с Hugging Face Hub")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки OmniLing: {e}", exc_info=True)
+            raise RuntimeError("Не удалось загрузить модель перевода OmniLing") from e
 
+    # ------------------------------------------------------------------
+    # Ленивая загрузка Demucs
+    # ------------------------------------------------------------------
+    def _get_demucs(self):
+        if self._demucs_model is None:
+            logger.info("Ленивая загрузка Demucs (htdemucs)...")
+            try:
+                self._demucs_model = get_model('htdemucs')
+                self._demucs_model.eval()
+                self._demucs_model.to(self.device)
+                logger.info("Demucs успешно загружен")
+            except Exception as e:
+                logger.error(f"Ошибка загрузки Demucs: {e}", exc_info=True)
+                raise RuntimeError("Не удалось загрузить модель Demucs") from e
+        return self._demucs_model
+
+    # ------------------------------------------------------------------
+    # Основные методы обработки
+    # ------------------------------------------------------------------
     def separate_voice_background(self, audio_path: str) -> tuple[str, str]:
-        """Разделяет аудио на голос и фоновые звуки"""
-        logger.info(f"Начинаем разделение аудио: {audio_path}")
-        
-        # Загружаем аудио
-        logger.info("Загрузка аудио файла...")
+        logger.info(f"Разделение аудио: {audio_path}")
         waveform, sample_rate = torchaudio.load(audio_path)
         waveform = waveform.to(self.device)
-        logger.info(f"Аудио загружено: {waveform.shape}, sample_rate: {sample_rate}")
-        
-        # Применяем Demucs
-        logger.info("Применяем Demucs для разделения...")
-        sources = self.demucs_model.separate(waveform)
-        logger.info("Разделение выполнено успешно")
-        
-        # Получаем директорию для сохранения
+        waveform = ensure_stereo(waveform, sample_rate)
+        demucs_model = self._get_demucs()
+
+        with torch.no_grad():
+            sources = apply_model(
+                demucs_model,
+                waveform.unsqueeze(0),
+                device=self.device,
+                shifts=1,
+                split=True,
+                overlap=0.25,
+                progress=True,
+            )[0]
+
+        vocals = sources[3].cpu()
+        background = (sources[0] + sources[1] + sources[2]).cpu()
+
         output_dir = os.path.dirname(audio_path)
         vocals_path = os.path.join(output_dir, "vocals.wav")
         background_path = os.path.join(output_dir, "background.wav")
-        
-        # Сохраняем результаты
-        logger.info("Сохранение результатов разделения...")
-        torchaudio.save(vocals_path, sources[0].cpu(), sample_rate)
-        torchaudio.save(background_path, sources[1].cpu(), sample_rate)
-        logger.info("Результаты сохранены успешно")
-        
+
+        torchaudio.save(vocals_path, vocals, sample_rate)
+        torchaudio.save(background_path, background, sample_rate)
+
+        logger.info(f"Сохранено: {vocals_path} и {background_path}")
         return vocals_path, background_path
-    
+
     def transcribe_audio(self, audio_path: str) -> str:
-        """Транскрибирует аудио в текст"""
-        logger.info(f"Начинаем транскрибацию: {audio_path}")
-        
-        # Загружаем аудио
-        logger.info("Загрузка аудио для транскрибации...")
+        logger.info(f"Транскрибация: {audio_path}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
         waveform, sample_rate = torchaudio.load(audio_path)
-        waveform = waveform.to(self.device)
-        logger.info("Аудио загружено успешно")
-        
-        # Подготавливаем входные данные
-        logger.info("Подготовка входных данных для Whisper...")
-        input_features = self.whisper_processor(
-            waveform, 
-            sampling_rate=sample_rate, 
-            return_tensors="pt"
-        ).input_features.to(self.device)
-        logger.info("Входные данные подготовлены")
-        
-        # Получаем транскрипцию
-        logger.info("Выполнение транскрибации...")
-        predicted_ids = self.whisper_model.generate(input_features)
-        transcription = self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-        logger.info(f"Транскрибация завершена: {transcription[:50]}...")
-        
+        target_sr = 16000
+        if sample_rate != target_sr:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=target_sr)
+            waveform = resampler(waveform)
+            sample_rate = target_sr
+
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0)
+        else:
+            waveform = waveform.squeeze(0)
+
+        segment_length = 30 * sample_rate
+        overlap = 1 * sample_rate
+        stride = segment_length - overlap
+        total_samples = waveform.shape[0]
+
+        if total_samples <= segment_length:
+            segments = [(0, total_samples)]
+        else:
+            segments = []
+            start = 0
+            while start < total_samples:
+                end = min(start + segment_length, total_samples)
+                segments.append((start, end))
+                if end == total_samples:
+                    break
+                start += stride
+            logger.info(f"Аудио разбито на {len(segments)} сегментов")
+
+        transcriptions = []
+        for i, (start, end) in enumerate(segments, 1):
+            segment = waveform[start:end]
+            if segment.shape[0] < 1 * sample_rate:
+                continue
+            input_features = self.whisper_processor(
+                segment.cpu(), sampling_rate=sample_rate, return_tensors="pt"
+            ).input_features.to(self.device)
+            with torch.no_grad():
+                predicted_ids = self.whisper_model.generate(input_features)
+            segment_text = self.whisper_processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+            transcriptions.append(segment_text)
+            logger.info(f"Сегмент {i}/{len(segments)}: '{segment_text[:50]}...'")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+
+        transcription = " ".join(transcriptions).strip()
+        logger.info(f"Транскрибация завершена. Итог: {transcription[:60]}...")
         return transcription
-    
+
     def translate_text(self, text: str) -> str:
-        """Переводит текст с английского на русский"""
-        logger.info("Начинаем перевод текста...")
-        
-        # Токенизируем текст
-        logger.info("Токенизация текста...")
-        encoded = self.translator_tokenizer(
-            text, 
-            return_tensors="pt",
-            src_lang="en",
-            padding=True
-        ).to(self.device)
-        logger.info("Токенизация завершена")
-        
-        # Получаем перевод
-        logger.info("Выполнение перевода...")
-        translated = self.translator_model.generate(
-            **encoded,
-            forced_bos_token_id=self.translator_tokenizer.get_lang_id("ru")
-        )
-        translation = self.translator_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
-        logger.info(f"Перевод завершен: {translation[:50]}...")
-        
-        return translation
+        """Перевод с английского на русский с помощью OmniLing (GGUF)."""
+        logger.info("Перевод текста...")
+        if not text or len(text.strip()) == 0:
+            return ""
+
+        # Разбиваем на предложения и группируем в чанки по 100 слов
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        if len(sentences) == 1 and not any(ch in text for ch in ['.', '!', '?']):
+            sentences = [text]
+
+        max_words_per_chunk = 100
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        for sent in sentences:
+            word_count = len(sent.split())
+            if word_count == 0:
+                continue
+            if current_len + word_count <= max_words_per_chunk:
+                current_chunk.append(sent)
+                current_len += word_count
+            else:
+                if current_chunk:
+                    chunks.append(' '.join(current_chunk))
+                current_chunk = [sent]
+                current_len = word_count
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+
+        logger.info(f"Текст разбит на {len(chunks)} чанков для перевода")
+
+        translated_chunks = []
+        for i, chunk in enumerate(chunks, 1):
+            logger.info(f"Перевод чанка {i}/{len(chunks)} (символов: {len(chunk)}, слов: {len(chunk.split())})")
+            if not chunk.strip():
+                translated_chunks.append("")
+                continue
+
+            # Промпт в формате Llama 3 Instruct (ожидаемый моделью OmniLing)
+            prompt = (
+                f"<|start_header_id|>system<|end_header_id|>\n"
+                f"You are a helpful AI assistant.<|eot_id|>"
+                f"<|start_header_id|>user<|end_header_id|>\n"
+                f"Translate this text from English to Russian:\n\n{chunk}<|eot_id|>"
+                f"<|start_header_id|>assistant<|end_header_id|>\n"
+            )
+
+            try:
+                response = self.translator(
+                    prompt,
+                    max_tokens=512,
+                    temperature=0.2,
+                    stop=["<|eot_id|>"],
+                    echo=False,
+                )
+                translation = response['choices'][0]['text'].strip()
+                translated_chunks.append(translation)
+                logger.info(f"Чанк {i} переведён")
+            except Exception as e:
+                logger.error(f"Ошибка при переводе чанка {i}: {e}", exc_info=True)
+                translated_chunks.append("")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+        result = " ".join(translated_chunks).strip()
+        logger.info(f"Перевод завершён. Результат: {result[:60]}...")
+        return result
