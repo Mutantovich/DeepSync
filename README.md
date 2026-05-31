@@ -42,7 +42,7 @@ pip install -r requirements.txt
 ```
 
 3. Установите FFmpeg:
-- Windows: Скачайте с [официального сайта](https://ffmpeg.org/download.html)
+- Windows: `winget install "FFmpeg (Shared)"`
 - Linux: `sudo apt install ffmpeg`
 - macOS: `brew install ffmpeg`
 
