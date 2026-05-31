@@ -32,13 +32,10 @@ class AudioProcessor:
         
         # Проверяем наличие кэш-директории
         logger.info(f"Проверка кэш-директории: {self.CACHE_DIR}")
-        if not os.path.exists(self.CACHE_DIR):
-            logger.info("Кэш-директория не найдена, создаем...")
-            os.makedirs(self.CACHE_DIR, exist_ok=True)
+        os.makedirs(self.CACHE_DIR, exist_ok=True)
         
-        # Загружаем все модели
-        logger.info("Начинаем загрузку всех моделей...")
-        self._download_all_models()
+        # Убеждаемся, что все модели загружены в кэш
+        self._ensure_models_available()
         
         # Инициализируем модели
         logger.info("Инициализация моделей...")
@@ -46,80 +43,52 @@ class AudioProcessor:
         
         logger.info("Инициализация AudioProcessor завершена успешно")
 
-    def _download_all_models(self):
-        """Загружает все необходимые модели"""
-        for model_name, model_path in self.MODELS.items():
-            cache_path = os.path.join(self.CACHE_DIR, "models--" + model_path.replace("/", "--"))
-            config_path = os.path.join(cache_path, "snapshots")
-            
-            # Проверяем наличие директории snapshots и config.json
-            need_download = (
-                not os.path.exists(cache_path) or 
-                not os.path.exists(config_path) or 
-                not any(f.endswith('config.json') for f in os.listdir(config_path) if os.path.isfile(os.path.join(config_path, f)))
-            )
-            
-            if need_download:
-                logger.info(f"Загрузка модели {model_name} ({model_path}) из Hugging Face...")
-                try:
-                    logger.info(f"Создание директории для модели: {cache_path}")
-                    os.makedirs(cache_path, exist_ok=True)
-                    
-                    logger.info(f"Начинаем загрузку файлов модели {model_name}...")
-                    snapshot_download(
-                        repo_id=model_path,
-                        local_files_only=False,
-                        local_dir=cache_path,
-                        tqdm_class=tqdm,
-                        force_download=True  # Принудительно загружаем, если нет config.json
-                    )
-                    logger.info(f"Модель {model_name} успешно загружена в {cache_path}")
-                except Exception as e:
-                    logger.error(f"Ошибка при загрузке {model_name}: {str(e)}")
-                    if os.path.exists(cache_path):
-                        logger.info(f"Удаление поврежденной директории: {cache_path}")
-                        shutil.rmtree(cache_path, ignore_errors=True)
-                    raise
-            else:
-                logger.info(f"Модель {model_name} уже есть в кэше: {cache_path}")
-                try:
-                    snapshot_path = os.path.join(cache_path, "snapshots")
-                    files = [f for f in os.listdir(snapshot_path) if f.endswith('config.json')]
-                    logger.info(f"Найдены файлы конфигурации: {', '.join(files)}")
-                except Exception as e:
-                    logger.warning(f"Проблема с кэшем модели {model_name}: {str(e)}")
-                    logger.info("Попытка повторной загрузки...")
-                    if os.path.exists(cache_path):
-                        shutil.rmtree(cache_path, ignore_errors=True)
-                    self._download_model(model_name, model_path, force=True)
-
-    def _download_model(self, model_name: str, model_path: str, force: bool = False):
-        """Загружает конкретную модель"""
-        cache_path = os.path.join(self.CACHE_DIR, "models--" + model_path.replace("/", "--"))
-        
-        logger.info(f"Загрузка модели {model_name} ({model_path}) из Hugging Face...")
+    def _model_is_cached(self, model_id: str) -> bool:
+        """
+        Проверяет, загружена ли модель в кэш, пытаясь загрузить процессор с local_files_only=True.
+        Для M2M100 используем токенизатор.
+        """
         try:
-            logger.info(f"Создание директории для модели: {cache_path}")
-            os.makedirs(cache_path, exist_ok=True)
-            
-            logger.info(f"Начинаем загрузку файлов модели {model_name}...")
+            if "whisper" in model_id:
+                WhisperProcessor.from_pretrained(model_id, local_files_only=True, cache_dir=self.CACHE_DIR)
+            else:
+                M2M100Tokenizer.from_pretrained(model_id, local_files_only=True, cache_dir=self.CACHE_DIR)
+            return True
+        except Exception:
+            return False
+
+    def _ensure_models_available(self):
+        """Загружает все модели, если их нет в кэше"""
+        for model_name, model_id in self.MODELS.items():
+            if self._model_is_cached(model_id):
+                logger.info(f"Модель {model_name} уже есть в кэше")
+            else:
+                logger.info(f"Модель {model_name} не найдена в кэше, начинаем загрузку...")
+                self._download_model(model_name, model_id)
+
+    def _download_model(self, model_name: str, model_id: str):
+        """Загружает модель через snapshot_download в стандартную структуру кэша"""
+        logger.info(f"Загрузка модели {model_name} ({model_id}) из Hugging Face...")
+        try:
             snapshot_download(
-                repo_id=model_path,
-                local_files_only=False,
-                local_dir=cache_path,
+                repo_id=model_id,
+                cache_dir=self.CACHE_DIR,
                 tqdm_class=tqdm,
-                force_download=force
+                force_download=False,
+                resume_download=True
             )
-            logger.info(f"Модель {model_name} успешно загружена в {cache_path}")
+            logger.info(f"Модель {model_name} успешно загружена")
         except Exception as e:
             logger.error(f"Ошибка при загрузке {model_name}: {str(e)}")
+            # Удаляем возможный частичный кэш, чтобы избежать повреждённых данных
+            cache_subdir = "models--" + model_id.replace("/", "--")
+            cache_path = os.path.join(self.CACHE_DIR, cache_subdir)
             if os.path.exists(cache_path):
-                logger.info(f"Удаление поврежденной директории: {cache_path}")
                 shutil.rmtree(cache_path, ignore_errors=True)
-            raise
+            raise RuntimeError(f"Не удалось загрузить модель {model_name}") from e
 
     def _initialize_models(self):
-        """Инициализирует все модели"""
+        """Инициализирует все модели (Demucs, Whisper, переводчик)"""
         # Инициализация Demucs
         logger.info("Инициализация Demucs...")
         try:
@@ -133,39 +102,48 @@ class AudioProcessor:
 
         # Инициализация Whisper
         logger.info("Инициализация Whisper...")
+        whisper_id = self.MODELS["whisper-base"]
         try:
+            # Пытаемся загрузить локально
             self.whisper_processor = WhisperProcessor.from_pretrained(
-                self.MODELS["whisper-base"],
-                local_files_only=True,
-                cache_dir=self.CACHE_DIR
+                whisper_id, local_files_only=True, cache_dir=self.CACHE_DIR
             )
             self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
-                self.MODELS["whisper-base"],
-                local_files_only=True,
-                cache_dir=self.CACHE_DIR
+                whisper_id, local_files_only=True, cache_dir=self.CACHE_DIR
             ).to(self.device)
-            logger.info("Whisper инициализирован успешно")
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации Whisper: {str(e)}")
-            raise
+            logger.info("Whisper загружен из кэша")
+        except Exception:
+            logger.info("Локальная копия Whisper не найдена, загружаем из сети...")
+            self.whisper_processor = WhisperProcessor.from_pretrained(
+                whisper_id, local_files_only=False, cache_dir=self.CACHE_DIR
+            )
+            self.whisper_model = WhisperForConditionalGeneration.from_pretrained(
+                whisper_id, local_files_only=False, cache_dir=self.CACHE_DIR
+            ).to(self.device)
+            logger.info("Whisper загружен из сети и сохранён в кэш")
+        logger.info("Whisper инициализирован успешно")
 
-        # Инициализация переводчика
+        # Инициализация переводчика M2M100
         logger.info("Инициализация переводчика...")
+        m2m_id = self.MODELS["m2m100"]
         try:
             self.translator_model = M2M100ForConditionalGeneration.from_pretrained(
-                self.MODELS["m2m100"],
-                local_files_only=True,
-                cache_dir=self.CACHE_DIR
+                m2m_id, local_files_only=True, cache_dir=self.CACHE_DIR
             ).to(self.device)
             self.translator_tokenizer = M2M100Tokenizer.from_pretrained(
-                self.MODELS["m2m100"],
-                local_files_only=True,
-                cache_dir=self.CACHE_DIR
+                m2m_id, local_files_only=True, cache_dir=self.CACHE_DIR
             )
-            logger.info("Переводчик инициализирован успешно")
-        except Exception as e:
-            logger.error(f"Ошибка при инициализации переводчика: {str(e)}")
-            raise
+            logger.info("Переводчик загружен из кэша")
+        except Exception:
+            logger.info("Локальная копия переводчика не найдена, загружаем из сети...")
+            self.translator_model = M2M100ForConditionalGeneration.from_pretrained(
+                m2m_id, local_files_only=False, cache_dir=self.CACHE_DIR
+            ).to(self.device)
+            self.translator_tokenizer = M2M100Tokenizer.from_pretrained(
+                m2m_id, local_files_only=False, cache_dir=self.CACHE_DIR
+            )
+            logger.info("Переводчик загружен из сети и сохранён в кэш")
+        logger.info("Переводчик инициализирован успешно")
 
     def separate_voice_background(self, audio_path: str) -> tuple[str, str]:
         """Разделяет аудио на голос и фоновые звуки"""
@@ -245,4 +223,4 @@ class AudioProcessor:
         translation = self.translator_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
         logger.info(f"Перевод завершен: {translation[:50]}...")
         
-        return translation 
+        return translation
